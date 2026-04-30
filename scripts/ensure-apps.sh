@@ -61,13 +61,19 @@ echo "[INFO] ensure-apps: vérification de cohérence BDD ↔ filesystem..."
 # NC 33 utilise la colonne "appid" (pas "app"). On récupère TOUTES les apps
 # connues (enabled=yes OU no) car même une app disabled doit être présente sur
 # le filesystem pour pouvoir être ré-activée sans erreur.
-DB_APPS=$(PGPASSWORD="$POSTGRESQL_ADDON_PASSWORD" psql \
-    -h "$POSTGRESQL_ADDON_HOST" \
-    -p "$POSTGRESQL_ADDON_PORT" \
-    -U "$POSTGRESQL_ADDON_USER" \
-    -d "$POSTGRESQL_ADDON_DB" \
-    -tAc "SELECT DISTINCT appid FROM oc_appconfig
-           WHERE configkey = 'enabled';" 2>/dev/null || true)
+PG_OPTS=(-h "$POSTGRESQL_ADDON_HOST" -p "$POSTGRESQL_ADDON_PORT"
+         -U "$POSTGRESQL_ADDON_USER" -d "$POSTGRESQL_ADDON_DB" -tAc)
+
+DB_APPS=$(PGPASSWORD="$POSTGRESQL_ADDON_PASSWORD" psql "${PG_OPTS[@]}" \
+    "SELECT DISTINCT appid FROM oc_appconfig
+      WHERE configkey = 'enabled';" 2>/dev/null || true)
+
+# Liste des apps explicitement désactivées par l'utilisateur. Sert à savoir
+# si l'on doit passer --keep-disabled lors de la réinstall — sinon
+# `app:install` réactiverait par défaut une app que l'utilisateur a désactivée.
+DISABLED_APPS=$(PGPASSWORD="$POSTGRESQL_ADDON_PASSWORD" psql "${PG_OPTS[@]}" \
+    "SELECT appid FROM oc_appconfig
+      WHERE configkey = 'enabled' AND configvalue = 'no';" 2>/dev/null || true)
 
 if [ -z "$DB_APPS" ]; then
     echo "[INFO] ensure-apps: aucune app en BDD ou BDD inaccessible — skip réconciliation."
@@ -81,16 +87,24 @@ else
             continue
         fi
 
+        # --keep-disabled uniquement si l'app était désactivée en BDD : sinon
+        # une app que l'utilisateur avait activée serait remise à 'enabled=no'
+        # silencieusement après le redémarrage.
+        KEEP_DISABLED=()
+        if echo "$DISABLED_APPS" | grep -Fxq "$app"; then
+            KEEP_DISABLED=(--keep-disabled)
+        fi
+
         # App en BDD mais absente du filesystem — réinstaller
         # memory_limit=1G : certaines apps (richdocumentscode ~700 MB) dépassent
         # la limite CLI par défaut lors du téléchargement/extraction.
         echo "[WARN] ensure-apps: '$app' en BDD mais absente du filesystem — réinstallation..."
-        if php -d memory_limit=1G "$REAL_APP/occ" app:install "$app" --keep-disabled --no-interaction 2>/dev/null; then
+        if php -d memory_limit=1G "$REAL_APP/occ" app:install "$app" "${KEEP_DISABLED[@]}" --no-interaction 2>/dev/null; then
             echo "[OK] ensure-apps: '$app' réinstallée."
             CHANGED=1
         else
             # Tentative avec --force (app déjà enregistrée en BDD)
-            if php -d memory_limit=1G "$REAL_APP/occ" app:install "$app" --force --keep-disabled --no-interaction 2>/dev/null; then
+            if php -d memory_limit=1G "$REAL_APP/occ" app:install "$app" --force "${KEEP_DISABLED[@]}" --no-interaction 2>/dev/null; then
                 echo "[OK] ensure-apps: '$app' réinstallée (force)."
                 CHANGED=1
             else
